@@ -1,0 +1,78 @@
+name: CI
+on:
+  pull_request:
+    types: ["opened", "reopened", "synchronize"]
+  push:
+    branches: ["master"]
+env:
+  NODE_VERSION: 20
+  PACKAGE_BUILD_FOLDER: build
+  NPM_VERSION: "^9.0.0"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: [1/2, 2/2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: |
+          ID=$(echo ${{matrix.shard}} | sed 's/[^0-9]*//g')
+          echo "id=$ID" >> $GITHUB_OUTPUT
+        id: randomid
+      - run: npm ci
+      - run: npm test -- --shard=${{matrix.shard}} --retry=10 --reporter=json --reporter=github-actions --outputFile=test-report-${{steps.randomid.outputs.id}}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{steps.randomid.outputs.id}}
+          path: test-report-${{steps.randomid.outputs.id}}.json
+
+  flaky-comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [test]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: test-report
+          pattern: test-report-*
+          merge-multiple: true
+      - run: ls -laR
+      - id: flaky
+        run: |
+          FLAKY=$(npx node-jq --slurp 'map(.testResults.[] | .name as $name | .assertionResults | select(.[].status == "passed") | map({ file: $name, name: .fullName, errors: .failureMessages | map(match(".*?\n.*?\n").string)})) | flatten' -- test-report/test-report-*)
+          {
+            echo "flaky<<EOF"
+            echo $FLAKY
+            echo EOF
+          } >> $GITHUB_OUTPUT
+      - run: echo ${{steps.flaky.outputs.flaky}}
+      - name: Find comment
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: Flaky Test Alert!
+      - name: Update comment
+        uses: peter-evans/create-or-update-comment@v4
+        if: ${{ contains(steps.flaky.outputs.flaky, '[') }}
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            # :warning: Flaky Test Alert!
+
+            One or more tests needed to be retried in order to succeed.  Please prioritize investigating these tests.
+
+            ```
+            ${{toJSON(fromJSON(steps.flaky.outputs.flaky))}}
+            ```
